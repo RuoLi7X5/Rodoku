@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#175cd3"/>
+      <stop offset="1" stop-color="#6941c6"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="52" height="52" rx="12" fill="url(#g)"/>
+  <rect x="16" y="16" width="32" height="32" rx="6" fill="#ffffff" opacity="0.94"/>
+  <path d="M16 27.2h32M16 36.8h32M27.2 16v32M36.8 16v32" stroke="#e4e7ec" stroke-width="2"/>
+  <text x="32" y="38" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace"
+        font-size="18" font-weight="800" text-anchor="middle" fill="#175cd3">R</text>
+</svg>
+
+
