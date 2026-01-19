@@ -216,6 +216,7 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  font-variant-numeric: tabular-nums;
 }
 
 .rankListScroll {
@@ -270,6 +271,7 @@
   padding: 10px;
   display: grid;
   gap: 6px;
+  font-variant-numeric: tabular-nums;
 }
 
 .listItemTop {
@@ -508,6 +510,103 @@
   background: rgba(192, 138, 80, 0.10);
 }
 
+/* Rodoku 删数高亮：红色小圆点包起来（用于回放/审计） */
+.delDot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 主盘面：候选格子空间更紧，圆点必须更小避免溢出 */
+  width: 1.25em;
+  height: 1.25em;
+  max-width: 100%;
+  max-height: 100%;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: #e11d48; /* red */
+  color: #fff;
+  font-weight: 900;
+  font-size: 0.92em;
+  line-height: 1;
+}
+
+.candDot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6em;
+  height: 1.6em;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 1em;
+  line-height: 1;
+  color: #fff;
+}
+.candDot.mk0 { background: #22c55e; } /* 绿 */
+.candDot.mk1 { background: #a855f7; } /* 紫 */
+.candDot.mk2 { background: #f97316; } /* 橙 */
+.candDot.mk3 { background: #b45309; } /* 棕 */
+.candDot.mk4 { background: #3b82f6; } /* 蓝 */
+.candDot.mk5 { background: #eab308; color: #111; } /* 黄（黑字更清晰） */
+.candDot.mk6 { background: #ec4899; } /* 粉 */
+.candDot.mk7 { background: #06b6d4; } /* 青 */
+
+.cell.isStrongCell {
+  /* 强区域（单元格）：蓝色背景（用 inset tint 避免与冲突红底完全冲突） */
+  box-shadow: inset 0 0 0 999px rgba(59, 130, 246, 0.24);
+}
+
+.cell.isWeakCell {
+  /* 弱区域（单元格）：浅蓝背景 */
+  box-shadow: inset 0 0 0 999px rgba(59, 130, 246, 0.14);
+}
+
+.cand.isRemoved {
+  opacity: 1;
+}
+
+/* /viz 技巧库快照：避免使用 vmin 导致“字比格子大” */
+.vizSnap {
+  width: 260px;
+  max-width: 260px;
+  container-type: inline-size;
+}
+
+.vizSnap .board {
+  border-radius: 10px;
+  padding: 1px;
+  box-shadow: none;
+}
+
+.vizSnap .value {
+  /* 基于容器宽度的相对字号（不依赖 viewport vmin） */
+  font-size: clamp(12px, 8cqi, 22px);
+  line-height: 1;
+}
+
+.vizSnap .cand {
+  /* 候选必须保证不溢出：更紧凑字号 + 紧凑行高 */
+  font-size: clamp(5px, 3.6cqi, 9px);
+  line-height: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.vizSnap .candGrid {
+  /* 候选网格紧凑：减少空隙并尽量占满格子 */
+  width: 92%;
+  height: 92%;
+  gap: 0px;
+  overflow: hidden;
+}
+
+/* /viz 快照里：候选标记小球需要更小，避免多候选时溢出单元格 */
+.vizSnap .candDot,
+.vizSnap .delDot {
+  width: 1.25em;
+  height: 1.25em;
+  font-size: 0.95em;
+}
+
 .pad {
   display: grid;
   gap: 10px;
@@ -592,6 +691,66 @@
   border: 1px solid #d0d5dd;
   border-radius: 12px;
   resize: vertical;
+}
+
+.structDetailBox {
+  width: 100%;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans",
+    "Liberation Sans", sans-serif;
+  padding: 10px 12px;
+  border: 1px solid #d0d5dd;
+  border-radius: 12px;
+  background: #fff;
+  display: grid;
+  gap: 6px;
+  line-height: 1.35;
+}
+
+.structLine1 {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.structLine2,
+.structLine3 {
+  font-size: 12px;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.structToken {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 10px;
+  border: 1px solid #e4e7ec;
+  background: #f9fafb;
+  font-size: 12px;
+  font-weight: 800;
+  color: #344054;
+}
+
+.structToken.t {
+  border-color: #b2ddff;
+  background: #eff8ff;
+  color: #175cd3;
+}
+
+.structToken.l {
+  border-color: #d6bbfb;
+  background: #f4f3ff;
+  color: #6941c6;
+}
+
+.structToken.r {
+  border-color: #e4e7ec;
+  background: #f9fafb;
+  color: #344054;
 }
 
 .btn {

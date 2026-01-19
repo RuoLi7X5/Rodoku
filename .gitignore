@@ -12,6 +12,24 @@ dist
 dist-ssr
 *.local
 
+# Python
+.venv
+venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+rodoku_py/_tmp_runs/
+rodoku_py/_runtime/
+rodoku_api/_techlib.json
+rodoku_api/_metrics.json
+rodoku_api/_learn_params.json
+rodoku_api/_replay.jsonl
+rodoku_api/_checkpoints/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

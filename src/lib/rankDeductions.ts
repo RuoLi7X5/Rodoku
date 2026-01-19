@@ -28,31 +28,19 @@ export function computeDeletableCandidates(board: Board, s: FoundStructure): Can
   const out: CandidateMark[] = []
   const R = s.R
   for (const [k, cnt] of linkCount.entries()) {
-    if (R === 0) {
-      // R=0: Link 覆盖 Truth 时额外覆盖到的其它候选都可删
-      // (即 Link 覆盖集合 - Truth 覆盖集合)
-      if (truth.has(k)) continue
-      const r = Number(k[0])
-      const c = Number(k[1])
-      const d = Number(k[2]) as Digit
-      out.push({ idx: rcToIndex(r, c), r, c, d })
-    } else if (R === 1) {
-      // R=1: 删除任何被2个弱区域覆盖的候选（即使被强区域覆盖也可删）
-      if (cnt >= 2) {
-        const r = Number(k[0])
-        const c = Number(k[1])
-        const d = Number(k[2]) as Digit
-        out.push({ idx: rcToIndex(r, c), r, c, d })
-      }
-    } else if (R === 2) {
-      // R=2: 删除任何被3个弱区域覆盖的候选
-      if (cnt >= 3) {
-        const r = Number(k[0])
-        const c = Number(k[1])
-        const d = Number(k[2]) as Digit
-        out.push({ idx: rcToIndex(r, c), r, c, d })
-      }
-    }
+    // 统一删数规则（与你现在的解释一致）：
+    // - 永远不删强区域覆盖到的候选（避免“把 Truth 自己删空/削弱”造成伪推理）
+    // - R=0: 未被 Truth 覆盖 且 被任意 Link 覆盖 -> 可删（等价于 cnt>=1）
+    // - R=1: 未被 Truth 覆盖 且 被 >=2 个 Link 覆盖 -> 可删
+    // - R=2: 未被 Truth 覆盖 且 被 >=3 个 Link 覆盖 -> 可删
+    if (truth.has(k)) continue
+    const need = R + 1
+    if (need <= 0) continue
+    if (cnt < need) continue
+    const r = Number(k[0])
+    const c = Number(k[1])
+    const d = Number(k[2]) as Digit
+    out.push({ idx: rcToIndex(r, c), r, c, d })
   }
 
   // 排序：按 r/c/d

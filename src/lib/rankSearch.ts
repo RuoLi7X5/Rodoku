@@ -31,6 +31,14 @@ export type FoundStructure = {
   R: number
   truths: RegionRef[]
   links: RegionRef[]
+  /** 可选：填数结论（技巧类结构可能直接给出落子） */
+  conclusion?: { idx: number; value: Digit }
+  /** 可选：来源标记（秩搜索 / 技巧库映射） */
+  source?: 'rank' | 'tech'
+  /** 可选：来源名称（如 XYZ-Wing / UR） */
+  sourceName?: string
+  /** 可选：来源说明 */
+  sourceDetail?: string
 }
 
 export type SearchProgress = {

@@ -26,6 +26,8 @@ import { computeDeletableCandidates } from './lib/rankDeductions'
 import { applyCandidateEliminations } from './lib/sudoku'
 import { solveBoardFast } from './lib/solver'
 import { parsePuzzleInput } from './lib/importPuzzle'
+import { runTechniques } from './techniques/engine'
+import { techniques } from './techniques'
 
 type Mode = 'value' | 'candidate'
 type MenuKey = 'file' | 'edit' | 'rank' | 'settings' | 'help'
@@ -181,11 +183,30 @@ export default function App() {
       delSig: string
       dels: Array<{ idx: number; d: Digit }>
       summary: string
+      isFill: boolean
     }> = []
     const seen = new Set<string>()
     const canGuide = solution != null && solutionKey === digitsKey
 
     for (const st of results) {
+      // 技巧类“填数结论”：允许无删数也展示
+      if (st.conclusion) {
+        const { idx, value } = st.conclusion
+        if (canGuide && solution![idx] !== value) continue
+        const sig = `fill:${value}@${idx}`
+        if (seen.has(sig)) continue
+        seen.add(sig)
+        const r = Math.floor(idx / 9) + 1
+        const c = (idx % 9) + 1
+        out.push({
+          struct: st,
+          delSig: sig,
+          dels: [],
+          summary: `r${r}c${c}=${value}`,
+          isFill: true,
+        })
+        continue
+      }
       const delsAll = computeDeletableCandidates(board, st)
       if (delsAll.length === 0) continue
       const dels = (canGuide ? delsAll.filter((m) => solution![m.idx] !== m.d) : delsAll) as Array<{
@@ -196,7 +217,7 @@ export default function App() {
       const sig = delSigOf(dels)
       if (seen.has(sig)) continue // 同删数去重
       seen.add(sig)
-      out.push({ struct: st, delSig: sig, dels, summary: compressDeletionSummary(dels) })
+      out.push({ struct: st, delSig: sig, dels, summary: compressDeletionSummary(dels), isFill: false })
     }
     return out
   }, [board, digitsKey, results, solution, solutionKey])
@@ -363,12 +384,6 @@ export default function App() {
     return `${ref.d}${up ? 'B' : 'b'}${ref.box + 1}`
   }
 
-  function formatStructureDetail(s: FoundStructure): string {
-    const tStr = s.truths.map((r) => formatRef(r, 'truth')).join('-')
-    const lStr = s.links.map((r) => formatRef(r, 'link')).join(' ')
-    return `T${s.T}=${tStr}\nL${s.L}={${lStr}}\nrank ${s.R}`
-  }
-
   const startSearch = useCallback(async () => {
     if (isSearching) return
     const minT = Math.max(1, Math.floor(tMin))
@@ -406,6 +421,49 @@ export default function App() {
     abortRef.current = ac
 
     try {
+      // 先跑技巧库：只有能提供 rankStructure 映射的技巧结果才会进入秩结构展示列表
+      const techFound = runTechniques(board, techniques, { signal: ac.signal })
+      let techSeq = 0
+      for (const tr of techFound) {
+        if (ac.signal.aborted) break
+        const rs = tr.rankStructure
+        if (rs) {
+          const truths = rs.truths
+          const links = rs.links
+          const T = rs.T ?? truths.length
+          const L = rs.L ?? links.length
+          const R = rs.R ?? L - T
+          if (R < 0 || R > 2) continue // 仅展示 R<3
+          const st: FoundStructure = {
+            id: `tech-${tr.techniqueId}-${++techSeq}`,
+            T,
+            L,
+            R,
+            truths,
+            links,
+            source: 'tech',
+            sourceName: tr.techniqueName,
+            sourceDetail: tr.detail,
+          }
+          setResults((prev) => prev.concat(st))
+        } else if (tr.conclusion) {
+          // 纯“填数结论”类技巧也允许展示（无 Truth/Link 绘制）
+          const st: FoundStructure = {
+            id: `tech-${tr.techniqueId}-${++techSeq}`,
+            T: 0,
+            L: 0,
+            R: 0,
+            truths: [],
+            links: [],
+            conclusion: tr.conclusion,
+            source: 'tech',
+            sourceName: tr.techniqueName,
+            sourceDetail: tr.detail,
+          }
+          setResults((prev) => prev.concat(st))
+        }
+      }
+
       const cache = getOrBuildSearchCache(board, cacheRef.current)
       cacheRef.current = cache
       const gen = searchRankStructures(
@@ -417,13 +475,12 @@ export default function App() {
       )
       for await (const st of gen) {
         if (ac.signal.aborted) break
-        // 只展示“有删数”的结构
+        // 只展示“有删数”的结构（并用解导航）
         const delsAll = computeDeletableCandidates(board, st)
         if (delsAll.length === 0) continue
-        // 用解做导航：仅保留能删掉“与解不一致”的候选
         const dels = delsAll.filter((m) => sol![m.idx] !== m.d)
         if (dels.length === 0) continue
-        setResults((prev) => prev.concat(st))
+        setResults((prev) => prev.concat({ ...st, source: 'rank' }))
       }
     } finally {
       setIsSearching(false)
@@ -678,10 +735,39 @@ export default function App() {
                     当前结构：#{selectedItem ? visibleItems.findIndex((x) => x.delSig === selectedItem.delSig) + 1 : '-'}
                   </div>
                   <span className={'tag' + (selectedStruct.R < 0 ? ' bad' : ' good')}>
-                    T{selectedStruct.T} / L{selectedStruct.L} / R{selectedStruct.R}
+                    T{selectedStruct.T} L{selectedStruct.L} R{selectedStruct.R}
                   </span>
                 </div>
-                <textarea className="monoText" readOnly rows={4} value={formatStructureDetail(selectedStruct)} />
+                <div className="structDetailBox">
+                  <div className="structLine1">
+                    <span className="structToken t nowrap">{`T${selectedStruct.T}=${selectedStruct.truths
+                      .map((r) => formatRef(r, 'truth'))
+                      .join('-')}`}</span>
+                    <span className="structToken l nowrap">{`L${selectedStruct.L}={${selectedStruct.links
+                      .map((r) => formatRef(r, 'link'))
+                      .join(' ')}}`}</span>
+                    <span className="structToken r nowrap">{`R${selectedStruct.R}`}</span>
+                  </div>
+                  <div className="structLine2">
+                    {selectedStruct.source === 'tech' && selectedStruct.sourceName ? (
+                      <span>技巧名：{selectedStruct.sourceName}</span>
+                    ) : (
+                      <span className="muted">技巧名：-</span>
+                    )}
+                  </div>
+                  <div className="structLine3">
+                    {selectedStruct.conclusion ? (
+                      <span>
+                        填数{' '}
+                        {`r${Math.floor(selectedStruct.conclusion.idx / 9) + 1}c${
+                          (selectedStruct.conclusion.idx % 9) + 1
+                        }=${selectedStruct.conclusion.value}`}
+                      </span>
+                    ) : (
+                      <span>删数 {selectedItem?.summary ?? ''}</span>
+                    )}
+                  </div>
+                </div>
                 <div className="row" style={{ marginBottom: 6 }}>
                   <span className={'tag' + (selectedDeletions.length > 0 ? ' bad' : '')}>
                     可删候选：{selectedDeletions.length}
@@ -689,19 +775,29 @@ export default function App() {
                   <button
                     type="button"
                     className="smallBtn"
-                    disabled={selectedDeletions.length === 0}
+                    disabled={selectedStruct.conclusion ? false : selectedDeletions.length === 0}
                     onClick={() => {
+                      if (selectedStruct.conclusion) {
+                        // 应用“填数结论”
+                        setBoard((prev) => setCellValue(prev, selectedStruct.conclusion!.idx, selectedStruct.conclusion!.value))
+                        setSelectedDelSig(null)
+                        return
+                      }
                       // 应用删数：只删本结构的删数集合；随后列表会基于当前盘面自动隐藏同删数/无效结构
-                      setBoard((prev) => applyCandidateEliminations(prev, selectedDeletions.map((m) => ({ idx: m.idx, d: m.d }))))
+                      setBoard((prev) =>
+                        applyCandidateEliminations(
+                          prev,
+                          selectedDeletions.map((m) => ({ idx: m.idx, d: m.d })),
+                        ),
+                      )
                       setSelectedDelSig(null)
                     }}
                   >
                     应用
                   </button>
                 </div>
-                <div className="muted">删数：{selectedItem?.summary ?? ''}</div>
                 <div className="muted">
-                  Truth：单元格=蓝底；行/列/宫-数字=粗实线连接候选。Link：单元格=双层蓝框；行/列/宫-数字=双虚线连接候选（均为直角折线）。
+                  图例：Truth=单元格蓝底 / 行列宫-数字粗实线；Link=单元格双层蓝框 / 行列宫-数字单虚线（直角折线）；删数=红色实心圈。
                 </div>
               </div>
             ) : null}
@@ -726,7 +822,15 @@ export default function App() {
                       title="点击查看并在盘面上渲染该结构"
                     >
                       <div style={{ fontWeight: 900, fontSize: 12 }}>
-                        {idx + 1}. {it.struct.T}T{it.struct.L}L {it.summary}
+                        {it.struct.source === 'tech' && it.struct.sourceName ? (
+                          it.isFill ? (
+                            `${idx + 1}. ${it.struct.sourceName} ${it.summary}`
+                          ) : (
+                            `${idx + 1}. ${it.struct.sourceName} T${it.struct.T}L${it.struct.L} ${it.summary}`
+                          )
+                        ) : (
+                          `${idx + 1}. T${it.struct.T}L${it.struct.L} ${it.summary}`
+                        )}
                       </div>
                     </button>
                   ))
