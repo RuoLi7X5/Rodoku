@@ -112,6 +112,7 @@ class TruthOption:
     cand_idxs: List[int]
     forbid: str  # cell | rowDigit | colDigit | boxDigit
     size: int
+    heat: float = 0.0 # higher is better (more restricted)
 
 
 @dataclass
@@ -122,6 +123,8 @@ class SearchCache:
     house_key_row: List[str]
     house_key_col: List[str]
     house_key_box: List[str]
+    # Heat Map (density of candidates per cell)
+    cell_heat: List[float]  # 0..1, 1=most restricted (fewest candidates)
 
 
 def state_key(st: SudokuState) -> str:
@@ -137,15 +140,110 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
         return existing
 
     candidates: List[Candidate] = []
+    # cell_counts: count of candidates per cell (for heat map)
+    cell_counts = [0] * 81
+    
     for cell_idx in range(81):
         if st.grid[cell_idx] != 0:
             continue
         r, c = rc_of(cell_idx)
         b = box_of(r, c)
         allowed = st.allowed_mask(cell_idx)
+        cnt = 0
         for bit in iter_bits(allowed):
+            cnt += 1
             d = bit + 1
             candidates.append(Candidate(r=r, c=c, d=d, cell_idx=cell_idx, box=b))
+        cell_counts[cell_idx] = cnt
+
+    # Pre-calculate Heat Map: 1.0 / count (normalized). Fewer candidates = Hotter.
+    # Used to prioritize search in constrained areas.
+    cell_heat = [0.0] * 81
+    
+    # Advanced Feature Scan for Heat Map (User Request)
+    # 1. Bivalue Cells: +1.0
+    # 2. Conjugate Pairs: +0.5 per pair endpoint
+    # 3. ALS (Almost Locked Sets): +0.8 per cell in ALS
+    
+    # House candidate counts for conjugate pair detection
+    # (house_type, house_idx, digit) -> count
+    house_digit_counts: Dict[Tuple[str, int, int], int] = {}
+    house_digit_cells: Dict[Tuple[str, int, int], List[int]] = {}
+
+    for i in range(81):
+        if st.grid[i] != 0:
+            continue
+        # Base heat
+        c = cell_counts[i]
+        base_h = (1.0 / float(c)) if c > 0 else 2.0
+        cell_heat[i] = base_h
+        
+        # Bivalue Bonus
+        if c == 2:
+            cell_heat[i] += 1.0
+
+        # Collect for Conjugate Pairs
+        # Re-scan candidates for this cell to fill house maps
+        m = st.allowed_mask(i)
+        r, c_idx = rc_of(i)
+        b = box_of(r, c_idx)
+        for bit in iter_bits(m):
+            d = bit + 1
+            for (ht, hi) in [("row", r), ("col", c_idx), ("box", b)]:
+                k = (ht, hi, d)
+                house_digit_counts[k] = house_digit_counts.get(k, 0) + 1
+                if k not in house_digit_cells:
+                    house_digit_cells[k] = []
+                house_digit_cells[k].append(i)
+
+    # Apply Conjugate Pair Bonus
+    for k, count in house_digit_counts.items():
+        if count == 2:
+            for idx in house_digit_cells[k]:
+                cell_heat[idx] += 0.5
+
+    # Apply ALS Bonus (Simplified: Size 2, 3 in houses)
+    # ALS: N cells in house have union of candidates size N+1
+    for house_type in ("row", "col", "box"):
+        for h in range(9):
+            cells = [] # (idx, mask)
+            if house_type == "row":
+                for c in range(9):
+                    idx = idx_of(h, c)
+                    if st.grid[idx] == 0: cells.append((idx, st.allowed_mask(idx)))
+            elif house_type == "col":
+                for r in range(9):
+                    idx = idx_of(r, h)
+                    if st.grid[idx] == 0: cells.append((idx, st.allowed_mask(idx)))
+            else:
+                br = (h // 3) * 3
+                bc = (h % 3) * 3
+                for r in range(br, br + 3):
+                    for c in range(bc, bc + 3):
+                        idx = idx_of(r, c)
+                        if st.grid[idx] == 0: cells.append((idx, st.allowed_mask(idx)))
+            
+            # Check size 2 ALS (2 cells, 3 candidates)
+            L = len(cells)
+            if L >= 2:
+                for i in range(L-1):
+                    for j in range(i+1, L):
+                        u = cells[i][1] | cells[j][1]
+                        if u.bit_count() == 3:
+                            cell_heat[cells[i][0]] += 0.8
+                            cell_heat[cells[j][0]] += 0.8
+            # Check size 3 ALS (3 cells, 4 candidates) - simple heuristic
+            if L >= 3:
+                for i in range(L-2):
+                    for j in range(i+1, L-1):
+                        u2 = cells[i][1] | cells[j][1]
+                        if u2.bit_count() > 4: continue
+                        for k in range(j+1, L):
+                            u = u2 | cells[k][1]
+                            if u.bit_count() == 4:
+                                cell_heat[cells[i][0]] += 0.8
+                                cell_heat[cells[j][0]] += 0.8
+                                cell_heat[cells[k][0]] += 0.8
 
     house_key_row = [f"R:{cand.r}:{cand.d}" for cand in candidates]
     house_key_col = [f"C:{cand.c}:{cand.d}" for cand in candidates]
@@ -161,6 +259,15 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
                 m |= 1 << i
                 idxs.append(i)
         return m, idxs, len(idxs)
+
+    # Calculate avg heat for each option
+    def calc_heat(cand_idxs: List[int]) -> float:
+        if not cand_idxs: return 0.0
+        h = 0.0
+        for ci in cand_idxs:
+            cand = candidates[ci]
+            h += cell_heat[cand.cell_idx]
+        return h / len(cand_idxs)
 
     truth_options: List[TruthOption] = []
 
@@ -178,6 +285,7 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
                 cand_idxs=idxs,
                 forbid="cell",
                 size=size,
+                heat=calc_heat(idxs),
             )
         )
 
@@ -193,6 +301,7 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
                         cand_idxs=idxs,
                         forbid="rowDigit",
                         size=size,
+                        heat=calc_heat(idxs),
                     )
                 )
     for col in range(9):
@@ -206,6 +315,7 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
                         cand_idxs=idxs,
                         forbid="colDigit",
                         size=size,
+                        heat=calc_heat(idxs),
                     )
                 )
     for box in range(9):
@@ -219,10 +329,13 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
                         cand_idxs=idxs,
                         forbid="boxDigit",
                         size=size,
+                        heat=calc_heat(idxs),
                     )
                 )
 
-    truth_options.sort(key=lambda x: x.size)
+    # Sort key: (size, -heat)
+    truth_options.sort(key=lambda x: (x.size, -x.heat))
+    
     return SearchCache(
         key=key,
         candidates=candidates,
@@ -230,6 +343,7 @@ def build_search_cache(st: SudokuState, existing: Optional[SearchCache] = None) 
         house_key_row=house_key_row,
         house_key_col=house_key_col,
         house_key_box=house_key_box,
+        cell_heat=cell_heat,
     )
 
 
@@ -296,7 +410,10 @@ def search_rank_structures(
         if truth_size_jitter > 0:
             truth_options = sorted(
                 truth_options,
-                key=lambda o: (float(o.size) + truth_size_jitter * float(rng.random()), float(rng.random())),
+                key=lambda o: (
+                    float(o.size) + truth_size_jitter * float(rng.random()), # Primary: Fuzzy Size
+                    -o.heat + 0.05 * float(rng.random()) # Secondary: Heat (descending), with tiny jitter
+                ),
             )
     bit_count = len(candidates)
 

@@ -21,6 +21,10 @@ export type RodokuRun = {
   startedAtMs: number
   finishedAtMs?: number
   status: 'idle' | 'running' | 'solved' | 'stuck' | 'aborted' | 'error'
+  // 后端实时状态（用于避免“没出步骤就像卡死”）
+  message?: string
+  lastStepAtMs?: number
+  lastHeartbeatAtMs?: number
   error?: string
   steps: RodokuStep[]
   // 每一步之后的盘面快照（用于回放）

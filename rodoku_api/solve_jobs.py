@@ -35,6 +35,9 @@ class SolveJob:
     attempts: int = 0
     params: Dict[str, Any] = field(default_factory=dict)
     last_progress_at_ms: int = 0
+    # liveness (heartbeat even when no new logical steps are found)
+    last_heartbeat_at_ms: int = 0
+    last_heartbeat_log_at_ms: int = 0
 
     # control
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -88,12 +91,15 @@ def create_job(
     enable_ur1: bool = True,
     use_policy: bool = False,
     rank_time_budget_ms: int = 1200,
+    max_runtime_ms: int | None = None,
+    max_idle_no_step_ms: int | None = None,
 ) -> SolveJob:
     jid = uuid.uuid4().hex
+    now = _now_ms()
     job = SolveJob(
         id=jid,
         puzzle=puzzle,
-        created_at_ms=_now_ms(),
+        created_at_ms=now,
         status="running",
         steps=[],
         snapshots=[],
@@ -107,8 +113,12 @@ def create_job(
             "enable_ur1": bool(enable_ur1),
             "use_policy": bool(use_policy),
             "rank_time_budget_ms": int(rank_time_budget_ms),
+            "max_runtime_ms": (int(max_runtime_ms) if max_runtime_ms is not None else None),
+            "max_idle_no_step_ms": (int(max_idle_no_step_ms) if max_idle_no_step_ms is not None else None),
         },
-        last_progress_at_ms=_now_ms(),
+        last_progress_at_ms=now,
+        last_heartbeat_at_ms=now,
+        last_heartbeat_log_at_ms=0,
         message="",
     )
     with _LOCK:
@@ -151,6 +161,74 @@ def _run_job(jid: str) -> None:
             return
 
         try:
+            # 可选：总时长/无新步数阈值（用于“反馈卡住”而不是停止）
+            # 设计目标：
+            # - 不结束 job（你明确希望持续自我进化）
+            # - 但要把“耗尽预算仍无删数/无新步”转为可观测事件，并触发一次策略切换
+            now0 = _now_ms()
+            max_runtime_ms = job.params.get("max_runtime_ms", None)
+            max_idle_no_step_ms = job.params.get("max_idle_no_step_ms", None)
+            hit_runtime = isinstance(max_runtime_ms, int) and max_runtime_ms > 0 and (now0 - int(job.created_at_ms) >= int(max_runtime_ms))
+            hit_idle = isinstance(max_idle_no_step_ms, int) and max_idle_no_step_ms > 0 and (
+                now0 - int(job.last_progress_at_ms or job.created_at_ms) >= int(max_idle_no_step_ms)
+            )
+            if hit_runtime or hit_idle:
+                # 1) 记录“停滞事件”（可视化/审计）
+                try:
+                    append_event(
+                        {
+                            "type": "stagnation",
+                            "job_id": jid,
+                            "puzzle": job.puzzle,
+                            "reason": ("max_runtime_ms" if hit_runtime else "max_idle_no_step_ms"),
+                            "params": dict(job.params),
+                            "last_progress_at_ms": int(job.last_progress_at_ms or 0),
+                            "last_heartbeat_at_ms": int(getattr(job, "last_heartbeat_at_ms", 0) or 0),
+                        }
+                    )
+                except Exception:
+                    pass
+
+                # 2) 让 learn_params 收到“无进展”的惩罚信号（相当于把“没删数”也纳入学习）
+                try:
+                    update_params({"basic": 0, "rank": 0, "techlib": 0, "ur": 0}, solved=False, progressed=False)
+                except Exception:
+                    pass
+
+                # 3) 策略切换（soft reset，不改盘面、不回退 best-so-far）
+                #   - 优先减少爆炸源：cell truth 往往最容易组合爆炸
+                #   - 提升探索：增加随机重启/抖动由 learn_params 间接生效
+                #   - 若有 ckpt，自动开启 use_policy（让 GPU 真正参与）
+                with _LOCK:
+                    jj = _JOBS.get(jid)
+                    if jj:
+                        # 软清零阈值：避免每轮都触发
+                        jj.created_at_ms = int(now0)
+                        jj.last_progress_at_ms = int(now0)
+                        jj.last_heartbeat_at_ms = int(now0)
+                        # 限制 cell：避免长时间卡在 cell_fast / subset_scan 组合爆炸
+                        tt = jj.params.get("truth_types", None)
+                        if isinstance(tt, list) and "cell" in tt:
+                            jj.params["truth_types"] = [x for x in tt if str(x) != "cell"]
+                        # 逐步增加 restarts 由 learn_params 控制；这里做一层兜底提升
+                        try:
+                            rr = int(jj.params.get("rank_time_budget_ms", 1200))
+                            # 卡住时不要继续无限加预算，先缩短一轮，让多轮重启更快反馈
+                            jj.params["rank_time_budget_ms"] = int(max(350, min(1600, rr)))
+                        except Exception:
+                            pass
+                        # 尝试自动启用 policy（若存在 ckpt）
+                        try:
+                            if not bool(jj.params.get("use_policy", False)) and policy_current_ckpt():
+                                jj.params["use_policy"] = True
+                        except Exception:
+                            pass
+                        _maybe_set_message(
+                            jj,
+                            kind="search",
+                            msg="停滞反馈：长时间无新增逻辑步，已触发策略切换（降 cell、调整预算、可用则启用 policy）",
+                        )
+
             # 关键升级：实时显示步骤
             # - solve_with_rank 内部每产出一步就回调 on_emit（包含 snapshot0）
             # - 这样前端不会“长时间无进度”，而是随着推理推进实时增长
@@ -221,6 +299,7 @@ def _run_job(jid: str) -> None:
 
             def on_rank_heartbeat(info: Dict[str, Any]) -> None:
                 # 更新“搜索心跳”（不改盘面，不计为逻辑步）
+                now = _now_ms()
                 try:
                     phase = str(info.get("phase", ""))
                     if phase == "t1_fast":
@@ -254,31 +333,9 @@ def _run_job(jid: str) -> None:
                             f"found={info.get('found',0)} elapsed={info.get('elapsed_ms',0)}ms"
                         )
                         kind = "search"
-                    elif phase == "forcing":
-                        stg = str(info.get("stage", ""))
-                        idx = info.get("idx", None)
-                        d = info.get("d", None)
-                        if isinstance(idx, int) and isinstance(d, int):
-                            r = idx // 9 + 1
-                            c = idx % 9 + 1
-                            rc = f"r{r}c{c}"
-                        else:
-                            rc = "r?c?"
-                        if stg == "try":
-                            msg = (
-                                f"搜索中：forcing(短链) 试探 {info.get('i','?')}/{info.get('n','?')} "
-                                f"assume {rc}={d if d is not None else '?'} elapsed={info.get('elapsed_ms',0)}ms"
-                            )
-                            kind = "search"
-                        elif stg == "found":
-                            msg = (
-                                f"已找到：forcing(短链) {rc}={d if d is not None else '?'} 导致矛盾 ⇒ 可删 "
-                                f"tested={info.get('tested','?')} elapsed={info.get('elapsed_ms',0)}ms"
-                            )
-                            kind = "found"
-                        else:
-                            msg = f"搜索中：forcing(短链) … elapsed={info.get('elapsed_ms',0)}ms"
-                            kind = "search"
+                    # DEPRECATED: Forcing chain logic removed
+                    # elif phase == "forcing":
+                    #     ... 
                     elif phase == "subset_scan":
                         msg = (
                             f"搜索中：SUBSET 子集扫描 "
@@ -321,22 +378,33 @@ def _run_job(jid: str) -> None:
                 with _LOCK:
                     jj = _JOBS.get(jid)
                     if jj:
+                        jj.last_heartbeat_at_ms = int(now)
                         _maybe_set_message(jj, kind=kind, msg=msg)
                 # 事件日志：记录搜索心跳（限频由 rank_engine 的 heartbeat_ms 控制）
                 try:
-                    append_event(
-                        {
-                            "type": "heartbeat",
-                            "job_id": jid,
-                            "puzzle": job.puzzle,
-                            "phase": str(info.get("phase", "")),
-                            "info": dict(info),
-                            "message": str(msg),
-                            "message_kind": str(kind),
-                            "use_policy": bool(p.get("use_policy", False)),
-                            "policy_ckpt": (policy_current_ckpt() if bool(p.get("use_policy", False)) else None),
-                        }
-                    )
+                    # 进一步限频：避免远程/Windows 文件系统写入抖动导致“看起来卡死”
+                    do_log = False
+                    with _LOCK:
+                        jj = _JOBS.get(jid)
+                        if jj:
+                            last = int(getattr(jj, "last_heartbeat_log_at_ms", 0) or 0)
+                            if now - last >= 900:
+                                jj.last_heartbeat_log_at_ms = int(now)
+                                do_log = True
+                    if do_log:
+                        append_event(
+                            {
+                                "type": "heartbeat",
+                                "job_id": jid,
+                                "puzzle": job.puzzle,
+                                "phase": str(info.get("phase", "")),
+                                "info": dict(info),
+                                "message": str(msg),
+                                "message_kind": str(kind),
+                                "use_policy": bool(p.get("use_policy", False)),
+                                "policy_ckpt": (policy_current_ckpt() if bool(p.get("use_policy", False)) else None),
+                            }
+                        )
                 except Exception:
                     pass
 
@@ -355,6 +423,33 @@ def _run_job(jid: str) -> None:
                 on_rank_heartbeat=on_rank_heartbeat,
             )
             job.attempts += 1
+            # 即使没有新 step，也要把“本次尝试消耗了多少”反馈出来（用于审计/学习）
+            try:
+                new_steps_cnt = max(0, int(len(res.steps) - old_len))
+                append_event(
+                    {
+                        "type": "attempt",
+                        "job_id": jid,
+                        "puzzle": job.puzzle,
+                        "attempt": int(job.attempts),
+                        "status": str(res.status),
+                        "old_len": int(old_len),
+                        "steps_total": int(len(res.steps)),
+                        "steps_new": int(new_steps_cnt),
+                        "params": dict(p),
+                        "use_policy": bool(p.get("use_policy", False)),
+                        "policy_ckpt": (policy_current_ckpt() if bool(p.get("use_policy", False)) else None),
+                    }
+                )
+            except Exception:
+                pass
+
+            # “无新增逻辑步”也触发一次轻量学习（否则数独会卡在“没删数就没数据”）
+            if res.status == "stuck" and len(res.steps) <= old_len:
+                try:
+                    update_params({"basic": 0, "rank": 0, "techlib": 0, "ur": 0}, solved=False, progressed=False)
+                except Exception:
+                    pass
 
             # 性能/体验：题解已完成时，先把 solved 状态立刻暴露给前端（减少“上一题结束到下一题开始”的等待）
             # 后面的 replay/metrics/techlib 收尾允许在已 solved 状态下继续执行。

@@ -38,11 +38,7 @@ class MetricsStore:
 def load_metrics() -> MetricsStore:
     path = METRICS_PATH
     if not path.exists():
-        legacy = legacy_path("_metrics.json")
-        if legacy.exists():
-            path = legacy
-        else:
-            return MetricsStore()
+        return MetricsStore()
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
         return MetricsStore(

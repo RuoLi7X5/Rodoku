@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import time
 
+try:
+    from .policy_runtime import evaluate_ur as evaluate_ur
+except Exception:
+    def evaluate_ur(state_key: str) -> Optional[float]:  # type: ignore[misc]
+        return None
+
 
 Digit = int  # 1..9
 
@@ -620,11 +626,12 @@ def solve_with_rank(
     if truth_types is None:
         truth_types = ["rowDigit", "colDigit", "boxDigit"]
     # link_types：允许与 truth_types 同维/跨维混用。
-    # 关键约束由 rank_engine 的删数公理保证：
-    # - Links 必须覆盖 Truth 候选全集（truth ⊆ covered）
-    # - 对于属于 Truth 的候选，不允许被“同类型区域”再次覆盖（避免同维自证）
-    # 因此这里不再默认剔除 cell；当用户启用 cell 时，cell 也可作为弱区域参与覆盖/删数。
+    # 关键修改：始终允许 cell 作为 Link（弱区域），以便捕捉短链/简单结构（如 Skyscraper/Kite）
+    # 从而避免用复杂的 House-House 结构（T=4+）去模拟简单的 cell 链接。
     link_types = list(truth_types)
+    if "cell" not in link_types:
+        link_types.append("cell")
+        
     # 单元格维度：当用户显式勾选 cell 时，启用“同屋 N格=N数”的子集删数（naked subset）
     enable_cell_subset = ("cell" in truth_types)
 
@@ -685,6 +692,45 @@ def solve_with_rank(
             st2.eliminate(idx, int(d))
         proof2 = dict(proof or {})
         qok = _quick_consistent(st2)
+        
+        # --- UR Safety Check ---
+        # 仅当启用 policy 时生效
+        if use_policy and qok:
+            try:
+                # 只有当删数较多或涉及关键逻辑时才检查，避免性能损耗过大
+                # 这里暂且对所有非 T=1 结构检查，或者简单地对所有有效删数检查
+                sk_before = st.export_state_key()
+                sk_after = st2.export_state_key()
+                ur0 = evaluate_ur(sk_before)
+                ur1 = evaluate_ur(sk_after)
+                
+                # 记录在 proof 里以便观察
+                proof2["ur_safety"] = {"u0": ur0, "u1": ur1}
+                
+                # 阈值判定：防止进入多解陷阱
+                # 如果从安全(>0.8)掉到危险(<0.4)，或者直接掉进深坑(<0.05)
+                is_unsafe = False
+                if ur1 is not None:
+                    if ur1 < 0.05:
+                        is_unsafe = True
+                    elif (ur0 is not None and ur0 > 0.8) and ur1 < 0.4:
+                        is_unsafe = True
+                
+                if is_unsafe:
+                    if on_rank_heartbeat:
+                        try:
+                            on_rank_heartbeat({
+                                "phase": "ur_sensor", 
+                                "msg": f"UR拦截: u0={ur0:.2f}->u1={ur1:.2f} 动作不安全",
+                                "u0": ur0, "u1": ur1
+                            })
+                        except Exception: pass
+                    proof2["referee_reason"] = "ur_unsafe"
+                    return False, proof2
+            except Exception:
+                pass
+        # -----------------------
+
         # 体验：referee 若在某些盘面上耗时过长，会造成 solve_job “卡在最后一步不动”
         # - 增加 time_budget_ms，超时返回 None（不做结论）
         # - None 时不直接否决（否则会把探索完全卡死），但会在 proof 中标记，reward 也会被惩罚
@@ -1636,7 +1682,10 @@ def solve_with_rank(
                             )
                             force_fills()
                             progressed_t1 = True
-                            break
+                            # 关键：一旦有删数，立即返回 True，触发主循环的 continue
+                            # 主循环的 continue 会重新从“T=1”和“rank0优先”开始，
+                            # 从而避免在发现小结构后继续在深层大结构里空转（解决冗余结构问题）
+                            return True
                 except StopIteration as e:
                     cache = e.value if hasattr(e, "value") else cache
                 except Exception:
@@ -1711,7 +1760,7 @@ def solve_with_rank(
                             )
                             force_fills()
                             progressed_f = True
-                            break
+                            return True
                 except StopIteration as e:
                     cache = e.value if hasattr(e, "value") else cache
                 except Exception:
@@ -1784,7 +1833,7 @@ def solve_with_rank(
                             )
                             force_fills()
                             progressed_hc = True
-                            break
+                            return True
                 except StopIteration as e:
                     cache = e.value if hasattr(e, "value") else cache
                 except Exception:
@@ -1875,7 +1924,7 @@ def solve_with_rank(
                                 )
                                 force_fills()
                                 progressed_cell = True
-                                break
+                                return True
                     except StopIteration as e:
                         cache = e.value if hasattr(e, "value") else cache
                     except Exception:

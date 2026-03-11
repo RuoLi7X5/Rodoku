@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from .nn_models import RodokuPolicyValueNet
 from .nn_state import encode_action, state_key_to_tensors
-from .replay_store import iter_recent
+from .replay_store import iter_recent, iter_ur_samples
 from .metrics_store import load_metrics, save_metrics
 
 
@@ -114,11 +114,46 @@ def stop_train_job() -> bool:
 
 
 def _sample_batch(batch_size: int) -> List[Dict[str, Any]]:
+    # Mix normal samples and UR negative samples
+    # Ratio: 80% normal, 20% UR (or 50/50 if normal samples are scarce)
+    
+    # 1. Normal samples
     rows = list(iter_recent(max_lines=5000))
-    if not rows:
+    # 2. UR samples
+    ur_rows = list(iter_ur_samples(max_lines=2000))
+    
+    if not rows and not ur_rows:
         return []
-    idxs = np.random.randint(0, len(rows), size=(batch_size,))
-    return [rows[int(i)] for i in idxs]
+        
+    out = []
+    
+    # Target counts
+    n_ur = int(batch_size * 0.25)
+    n_norm = batch_size - n_ur
+    
+    if ur_rows:
+        # Sample UR
+        idxs = np.random.randint(0, len(ur_rows), size=(n_ur,))
+        out.extend([ur_rows[int(i)] for i in idxs])
+    else:
+        n_norm = batch_size
+        
+    if rows:
+        # Sample Normal
+        # Adjust count if we couldn't fill UR quota
+        remaining = batch_size - len(out)
+        idxs = np.random.randint(0, len(rows), size=(remaining,))
+        out.extend([rows[int(i)] for i in idxs])
+    else:
+        # Only UR samples available? (Rare, but handle it)
+        remaining = batch_size - len(out)
+        if remaining > 0 and ur_rows:
+             idxs = np.random.randint(0, len(ur_rows), size=(remaining,))
+             out.extend([ur_rows[int(i)] for i in idxs])
+             
+    # Shuffle to avoid batch clustering
+    np.random.shuffle(out)
+    return out
 
 
 def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_every: int, mode: str, gamma: float) -> None:
@@ -142,6 +177,7 @@ def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_eve
             xs = []
             ys_pi = []
             ys_v = []
+            ys_ur = []  # New: UR targets
             after_keys = []
             dones = []
             for b in batch:
@@ -150,6 +186,11 @@ def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_eve
                     xs.append(x)
                     reward = float(b.get("reward", 0.0) or 0.0)
                     ys_v.append(reward)
+                    
+                    # UR Label: default to 1.0 (safe) if missing, 0.0 (trap) if present
+                    ur_val = float(b.get("ur_label", 1.0))
+                    ys_ur.append(ur_val)
+                    
                     after_keys.append(str(b.get("after_key", "")))
                     dones.append(bool(b.get("done", False)))
                     # multi-action：一个 step 可能包含多个 affected，统一做 multi-label BCE
@@ -169,10 +210,12 @@ def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_eve
             x_t = torch.from_numpy(np.stack(xs, axis=0)).to(device)
             y_pi = torch.from_numpy(np.stack(ys_pi, axis=0)).to(device)
             r_t = torch.from_numpy(np.array(ys_v, dtype=np.float32)).to(device)
+            ur_t = torch.from_numpy(np.array(ys_ur, dtype=np.float32)).to(device) # New
             done_t = torch.from_numpy(np.array(dones, dtype=np.float32)).to(device)
 
             model.train()
-            pi_logits, v = model(x_t)
+            # Updated to handle 4 outputs from GNN (policy, value, ur_score, rank_scores)
+            pi_logits, v, ur_score, rank_scores = model(x_t)
 
             # policy：masked BCEWithLogits（只在合法动作上计算 loss，避免学“非法动作”）
             # 注意：mask 来自 before_key 的合法候选集
@@ -193,10 +236,11 @@ def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_eve
                         x2, _m2 = state_key_to_tensors(ak)
                         xs2.append(x2)
                     except Exception:
-                        xs2.append(np.zeros((20, 9, 9), dtype=np.float32))
+                        xs2.append(np.zeros((22, 9, 9), dtype=np.float32))
                 x2_t = torch.from_numpy(np.stack(xs2, axis=0)).to(device)
                 with torch.no_grad():
-                    _pi2, v2 = model(x2_t)
+                    # Handle next state value (ignore ur_score/rank for bootstrap)
+                    _pi2, v2, _ur2, _rank2 = model(x2_t)
                 td_target = r_t + (1.0 - done_t) * float(gamma) * v2.detach()
                 adv = (td_target - v).detach().clamp(-2.0, 2.0)
             else:
@@ -223,7 +267,15 @@ def _run_job(job: TrainJob, batch_size: int, lr: float, max_steps: int, ckpt_eve
                 loss_pi = (bce * m_t).sum() / denom
 
             loss_v = F.mse_loss(v, td_target)
-            loss = loss_pi + 0.2 * loss_v
+
+            # UR Loss: Binary Cross Entropy
+            # ur_score is sigmoid output (0..1), ur_t is 0 or 1
+            # We want model to predict 0 for traps and 1 for safe states.
+            loss_ur = F.binary_cross_entropy(ur_score, ur_t)
+
+            # Weighting: UR safety is critical, but we don't want to overpower policy initially.
+            # Start with 0.5 weight.
+            loss = loss_pi + 0.2 * loss_v + 0.5 * loss_ur
 
             opt.zero_grad(set_to_none=True)
             loss.backward()

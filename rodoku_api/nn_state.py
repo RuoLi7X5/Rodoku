@@ -28,16 +28,122 @@ def _box_of(r: int, c: int) -> int:
     return (r // 3) * 3 + (c // 3)
 
 
+import itertools
+
+def _get_als_and_conj_maps(grid: np.ndarray, forb_masks: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    计算 ALS (Almost Locked Sets) 和 Conjugate Pairs (强链) 热力图。
+    - als_map: (9, 9) float, 每个格子参与 ALS 的次数
+    - conj_map: (9, 9) float, 每个格子参与强链的次数
+    """
+    als_map = np.zeros((9, 9), dtype=np.float32)
+    conj_map = np.zeros((9, 9), dtype=np.float32)
+    
+    # Precompute allowed candidates per cell
+    ALL = (1 << 9) - 1
+    row_used = np.zeros(9, dtype=int)
+    col_used = np.zeros(9, dtype=int)
+    box_used = np.zeros(9, dtype=int)
+    
+    for i in range(81):
+        v = grid[i]
+        if v != 0:
+            mask = 1 << (v - 1)
+            r, c = i // 9, i % 9
+            b = _box_of(r, c)
+            row_used[r] |= mask
+            col_used[c] |= mask
+            box_used[b] |= mask
+            
+    allowed_masks = np.zeros(81, dtype=int)
+    for i in range(81):
+        if grid[i] == 0:
+            r, c = i // 9, i % 9
+            b = _box_of(r, c)
+            used = row_used[r] | col_used[c] | box_used[b]
+            allowed_masks[i] = (ALL & ~used) & ~int(forb_masks[i])
+
+    # Helper to get indices for regions
+    region_indices = []
+    # Rows
+    for r in range(9): region_indices.append(list(range(r*9, (r+1)*9)))
+    # Cols
+    for c in range(9): region_indices.append(list(range(c, 81, 9)))
+    # Boxes
+    for b in range(9):
+        br, bc = (b // 3) * 3, (b % 3) * 3
+        indices = []
+        for dr in range(3):
+            for dc in range(3):
+                indices.append((br + dr) * 9 + (bc + dc))
+        region_indices.append(indices)
+
+    # 1. Conjugate Pairs (Strong Links)
+    # 某个区域内，某个数字只能填在两个位置
+    for indices in region_indices:
+        # Count occurrences of each digit 1..9
+        digit_counts = np.zeros(10, dtype=int)
+        digit_locs = [[] for _ in range(10)]
+        
+        for idx in indices:
+            if grid[idx] != 0: continue
+            mask = allowed_masks[idx]
+            for d in range(1, 10):
+                if (mask >> (d-1)) & 1:
+                    digit_counts[d] += 1
+                    digit_locs[d].append(idx)
+                    
+        for d in range(1, 10):
+            if digit_counts[d] == 2:
+                # Found conjugate pair
+                idx1, idx2 = digit_locs[d]
+                r1, c1 = idx1 // 9, idx1 % 9
+                r2, c2 = idx2 // 9, idx2 % 9
+                conj_map[r1, c1] += 1.0
+                conj_map[r2, c2] += 1.0
+
+    # 2. ALS (Almost Locked Sets)
+    # N cells contain N+1 candidates
+    # Search for size N=1..4
+    for indices in region_indices:
+        # Filter empty cells
+        empty_indices = [idx for idx in indices if grid[idx] == 0]
+        n_empty = len(empty_indices)
+        if n_empty < 1: continue
+        
+        # Limit N to 4 for performance (ALS typically small)
+        max_n = min(n_empty, 4)
+        
+        for n in range(1, max_n + 1):
+            # Check combinations of size n
+            for combo in itertools.combinations(empty_indices, n):
+                union_mask = 0
+                for idx in combo:
+                    union_mask |= allowed_masks[idx]
+                
+                num_candidates = bin(union_mask).count('1')
+                if num_candidates == n + 1:
+                    # Found ALS
+                    for idx in combo:
+                        r, c = idx // 9, idx // 9  # Wait, i // 9, i % 9
+                        r, c = idx // 9, idx % 9
+                        als_map[r, c] += 1.0
+
+    return als_map, conj_map
+
+
 def state_key_to_tensors(state_key: str) -> Tuple[np.ndarray, np.ndarray]:
     """
-    把 digits|forbiddenKey 转为网络输入（MVP）：
+    把 digits|forbiddenKey 转为网络输入：
     - x: (C, 9, 9) float32
-      C=20：
-        - 9 个通道：已填数字 one-hot（1..9）
-        - 9 个通道：allowed candidates one-hot（1..9）
-        - 1 个通道：given/filled mask（已填=1）
-        - 1 个通道：empties mask（空格=1）
-    - mask: (A,) float32，动作可用掩码（MVP 暂只返回全 1；后续可严格根据 allowed 计算）
+      C=22：
+        - 0-8: one-hot digits (1..9)
+        - 9-17: allowed candidates (1..9)
+        - 18: filled mask
+        - 19: empty mask
+        - 20: ALS heatmap (Explicit Feature)
+        - 21: Conjugate Pair heatmap (Explicit Feature)
+    - mask: (A,) float32
     """
     if "|" not in state_key:
         raise ValueError("bad state_key")
@@ -45,8 +151,15 @@ def state_key_to_tensors(state_key: str) -> Tuple[np.ndarray, np.ndarray]:
     if len(digits) != 81:
         raise ValueError("bad digits")
     forb_masks = _parse_forbidden_key(forb)
-    x = np.zeros((20, 9, 9), dtype=np.float32)
+    
+    # Update Channel Count to 22
+    x = np.zeros((22, 9, 9), dtype=np.float32)
     grid = np.array([int(ch) for ch in digits], dtype=np.int32)
+    
+    # Compute Explicit Features
+    als_map, conj_map = _get_als_and_conj_maps(grid, forb_masks)
+    x[20] = als_map
+    x[21] = conj_map
 
     # 预计算 row/col/box 已用数字 bitmask（bit0=>1）
     row_used = np.zeros((9,), dtype=np.int32)

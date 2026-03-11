@@ -23,14 +23,9 @@ class TechLib:
 
 
 def load_techlib() -> TechLib:
-    # 兼容迁移：若新路径不存在但旧路径存在，则读取旧文件（并在后续 save 时写入新路径）
     path = TECHLIB_PATH
     if not path.exists():
-        legacy = legacy_path("_techlib.json")
-        if legacy.exists():
-            path = legacy
-        else:
-            return TechLib(items={}, order=[])
+        return TechLib(items={}, order=[])
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
         items = obj.get("items", {}) or {}

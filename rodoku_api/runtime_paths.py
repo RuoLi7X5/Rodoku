@@ -14,12 +14,12 @@ def data_dir() -> Path:
     """
     运行时数据目录（避免 uvicorn --reload 监控到这些文件变化而重启，导致 solve_job 丢失）。
     - 可用环境变量 RODOKU_DATA_DIR 覆盖
-    - 默认：repo_root/rodoku_py/_runtime
+    - 默认：repo_root/data (统一数据存储位置)
     """
     env = os.environ.get("RODOKU_DATA_DIR")
     if env:
         return Path(env).expanduser().resolve()
-    return (repo_root() / "rodoku_py" / "_runtime").resolve()
+    return (repo_root() / "data").resolve()
 
 
 def ensure_data_dir() -> Path:

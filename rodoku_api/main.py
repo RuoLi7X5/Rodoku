@@ -108,6 +108,10 @@ class SolveJobStartRequest(BaseModel):
   enable_ur1: bool | None = None
   use_policy: bool | None = None
   rank_time_budget_ms: int | None = None
+  # 远程算力保护：超过上限自动停止（可选；null/<=0 表示不限制）
+  max_runtime_ms: int | None = None
+  # 远程算力保护：长时间无新增逻辑步时自动停止（可选；null/<=0 表示不限制）
+  max_idle_no_step_ms: int | None = None
 
 
 class StepOut(BaseModel):
@@ -124,6 +128,7 @@ class SolveJobStatusResponse(BaseModel):
   attempts: int
   params: dict
   last_progress_at_ms: int
+  last_heartbeat_at_ms: int | None = None
   message: str | None = None
   error: str | None = None
   steps: list[StepOut]
@@ -206,6 +211,8 @@ def solve_job_start(req: SolveJobStartRequest):
     enable_ur1=(True if req.enable_ur1 is None else bool(req.enable_ur1)),
     use_policy=(False if req.use_policy is None else bool(req.use_policy)),
     rank_time_budget_ms=(1200 if req.rank_time_budget_ms is None else int(req.rank_time_budget_ms)),
+    max_runtime_ms=(None if req.max_runtime_ms is None else int(req.max_runtime_ms)),
+    max_idle_no_step_ms=(None if req.max_idle_no_step_ms is None else int(req.max_idle_no_step_ms)),
   )
   return {"id": job.id}
 
@@ -220,6 +227,7 @@ def solve_job_status(job_id: str):
       "attempts": 0,
       "params": {},
       "last_progress_at_ms": 0,
+      "last_heartbeat_at_ms": 0,
       "error": "not_found",
       "steps": [],
       "snapshots": [],
@@ -230,6 +238,7 @@ def solve_job_status(job_id: str):
     "attempts": job.attempts,
     "params": job.params,
     "last_progress_at_ms": job.last_progress_at_ms,
+    "last_heartbeat_at_ms": getattr(job, "last_heartbeat_at_ms", 0),
     "message": getattr(job, "message", ""),
     "error": job.error,
     "steps": [
@@ -475,8 +484,130 @@ def train_start(req: TrainStartRequest):
   return {"ok": True, "id": j.id}
 
 
-@app.post("/train/stop")
-def train_stop():
-  ok = stop_train_job()
-  return {"ok": ok}
+class AutoSolveRequest(BaseModel):
+  enabled: bool
+  params: SolveJobStartRequest | None = None
+
+
+_AUTO_SOLVE_STATE: Dict[str, Any] = {
+    "enabled": False,
+    "last_job_id": None,
+    "params": None,
+}
+
+
+@app.post("/auto_solve/config")
+def auto_solve_config(req: AutoSolveRequest):
+    global _AUTO_SOLVE_STATE
+    _AUTO_SOLVE_STATE["enabled"] = req.enabled
+    if req.params:
+        _AUTO_SOLVE_STATE["params"] = req.params.model_dump()
+    
+    # 如果开启且当前没有任务，立即触发一个
+    if req.enabled and not _AUTO_SOLVE_STATE["last_job_id"]:
+        _trigger_next_auto_solve()
+        
+    return {"ok": True, "state": _AUTO_SOLVE_STATE}
+
+
+def _trigger_next_auto_solve():
+    """
+    后台自动生成新题并启动求解任务
+    """
+    global _AUTO_SOLVE_STATE
+    if not _AUTO_SOLVE_STATE["enabled"]:
+        return
+
+    # 生成新题（利用 ur_generator 的逻辑或随机生成）
+    # 这里简单起见，从 puzzle_bank 随机选一个并加随机扰动，
+    # 或者调用 generate_ur_dataset 的逻辑生成一个带 UR 陷阱的（更有训练价值）
+    from .puzzle_bank import get_puzzle_bank, SEED_PUZZLES
+    import random
+    
+    # 策略：混合使用 SEED_PUZZLES 和 get_puzzle_bank
+    # 为了增加多样性，可以对 puzzle 进行简单的行列变换（置换同组行/列，旋转等）
+    # MVP：随机选一个
+    bank = SEED_PUZZLES + get_puzzle_bank()
+    puzzle = random.choice(bank)
+    
+    # TODO: 实现真正的“实时生成器”接口 (Feature Request 4)
+    # 目前先用库题
+    
+    params = _AUTO_SOLVE_STATE.get("params") or {}
+    # 构造请求
+    req = SolveJobStartRequest(
+        puzzle=puzzle,
+        min_t=params.get("min_t", 1),
+        max_t=params.get("max_t", 12),
+        max_r=params.get("max_r", 3),
+        max_structures_per_step=params.get("max_structures_per_step", 200),
+        truth_types=params.get("truth_types"),
+        enable_ur1=params.get("enable_ur1", True),
+        use_policy=params.get("use_policy", False),
+        rank_time_budget_ms=params.get("rank_time_budget_ms", 1200),
+        max_runtime_ms=params.get("max_runtime_ms"),
+        max_idle_no_step_ms=params.get("max_idle_no_step_ms"),
+    )
+    
+    job = create_job(
+        req.puzzle,
+        min_t=req.min_t,
+        max_t=req.max_t,
+        max_r=req.max_r,
+        max_structures_per_step=req.max_structures_per_step,
+        truth_types=req.truth_types,
+        enable_ur1=(True if req.enable_ur1 is None else bool(req.enable_ur1)),
+        use_policy=(False if req.use_policy is None else bool(req.use_policy)),
+        rank_time_budget_ms=(1200 if req.rank_time_budget_ms is None else int(req.rank_time_budget_ms)),
+        max_runtime_ms=(None if req.max_runtime_ms is None else int(req.max_runtime_ms)),
+        max_idle_no_step_ms=(None if req.max_idle_no_step_ms is None else int(req.max_idle_no_step_ms)),
+    )
+    _AUTO_SOLVE_STATE["last_job_id"] = job.id
+    print(f"Auto-Solve: Started job {job.id} with puzzle {puzzle[:15]}...")
+
+
+@app.get("/auto_solve/status")
+def auto_solve_status():
+    global _AUTO_SOLVE_STATE
+    jid = _AUTO_SOLVE_STATE.get("last_job_id")
+    job_status = "idle"
+    if jid:
+        j = get_job(jid)
+        if j:
+            job_status = j.status
+            # 如果当前任务已完成/失败，且自动模式开启，则自动触发下一个
+            if _AUTO_SOLVE_STATE["enabled"] and job_status in ("solved", "error", "stopped"):
+                # 避免死循环狂刷：加一点延迟或检查时间
+                # 这里简单处理：由前端轮询触发，或者由 _trigger 异步触发
+                # 为了响应快，我们在 get status 时发现已结束就触发下一个
+                # 这种“惰性触发”依赖前端轮询，比较稳健
+                if j.status == "solved" or (j.status == "error" and "invalid" not in (j.error or "")):
+                     # 异步触发以免阻塞 status 返回
+                     import threading
+                     threading.Thread(target=_trigger_next_auto_solve, daemon=True).start()
+                     
+    return {
+        "enabled": _AUTO_SOLVE_STATE["enabled"],
+        "last_job_id": jid,
+        "job_status": job_status,
+    }
+
+
+@app.post("/auto_solve/skip")
+def auto_solve_skip():
+    """
+    跳过当前自动题目：停止当前 job 并触发下一题
+    """
+    global _AUTO_SOLVE_STATE
+    if not _AUTO_SOLVE_STATE["enabled"]:
+        return {"ok": False, "error": "not_enabled"}
+    
+    jid = _AUTO_SOLVE_STATE.get("last_job_id")
+    if jid:
+        stop_job(jid)
+    
+    # 异步触发下一题
+    import threading
+    threading.Thread(target=_trigger_next_auto_solve, daemon=True).start()
+    return {"ok": True}
 

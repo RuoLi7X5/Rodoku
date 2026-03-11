@@ -79,12 +79,14 @@ function LineChart({
   title,
   xs,
   ys,
+  description,
   width = 520,
   height = 160,
 }: {
   title: string
   xs: number[]
   ys: number[]
+  description?: string
   width?: number
   height?: number
 }) {
@@ -92,21 +94,33 @@ function LineChart({
   // 这样网格布局可以一行多列，不会被固定 width=520 撑成单列。
   const vw = width
   const vh = height
+  const hasData = xs.length > 1 && ys.length > 1
+  
   const pts = useMemo(() => {
     if (xs.length === 0 || ys.length === 0) return ''
     const n = Math.min(xs.length, ys.length)
-    const yMin = Math.min(...ys.slice(0, n))
-    const yMax = Math.max(...ys.slice(0, n))
+    // 过滤无效值
+    const validYs = ys.slice(0, n).filter(y => Number.isFinite(y))
+    if (validYs.length === 0) return ''
+    
+    const yMin = Math.min(...validYs)
+    const yMax = Math.max(...validYs)
+    // 防止一直线无法归一化
+    const range = yMax - yMin
+    const safeRange = range === 0 ? 1.0 : range
+    
     const dx = n <= 1 ? 0 : 1 / (n - 1)
     const normY = (y: number) => {
-      if (yMax === yMin) return 0.5
-      return (y - yMin) / (yMax - yMin)
+      if (!Number.isFinite(y)) return 0.5
+      return (y - yMin) / safeRange
     }
     const path: string[] = []
     for (let i = 0; i < n; i++) {
       const x = 10 + (vw - 20) * (dx * i)
       const y = 10 + (vh - 20) * (1 - normY(ys[i]))
-      path.push(`${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`)
+      if (Number.isFinite(y)) {
+          path.push(`${i === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`)
+      }
     }
     return path.join(' ')
   }, [xs, ys, vw, vh])
@@ -114,16 +128,27 @@ function LineChart({
   return (
     <div className="panel" style={{ marginBottom: 10 }}>
       <div className="panelTitle">{title}</div>
-      <svg
-        viewBox={`0 0 ${vw} ${vh}`}
-        width="100%"
-        height={vh}
-        style={{ display: 'block', background: '#fff', borderRadius: 10, border: '1px solid #eaecf0' }}
-      >
-        <path d={pts} fill="none" stroke="#175cd3" strokeWidth={2} />
-      </svg>
-      <div className="muted" style={{ marginTop: 6 }}>
-        提示：当前仅为前端占位图表；后续由后端输出 metrics 数据后即可自动渲染曲线。
+      <div style={{ position: 'relative', height: vh }}>
+        <svg
+            viewBox={`0 0 ${vw} ${vh}`}
+            width="100%"
+            height={vh}
+            style={{ display: 'block', background: '#fff', borderRadius: 10, border: '1px solid #eaecf0' }}
+        >
+            <path d={pts} fill="none" stroke="#175cd3" strokeWidth={2} />
+        </svg>
+        {!hasData && (
+            <div style={{ 
+                position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, 
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(255,255,255,0.6)', color: '#98a2b3', fontSize: 13
+            }}>
+                暂无足够数据 (N&lt;2)
+            </div>
+        )}
+      </div>
+      <div className="muted" style={{ marginTop: 6, minHeight: '1.5em' }}>
+        {description || '暂无说明'}
       </div>
     </div>
   )
@@ -425,7 +450,20 @@ function formatPrincipleShort(it: TechItem): string {
 
 export function VizPage() {
   const [text, setText] = useState<string>('')
-  const [backendUrl, setBackendUrl] = useState<string>('http://127.0.0.1:8000')
+  const [backendUrl, setBackendUrl] = useState<string>(() => {
+    try {
+      return localStorage.getItem('rodoku_backend_url') || 'http://127.0.0.1:8000'
+    } catch {
+      return 'http://127.0.0.1:8000'
+    }
+  })
+
+  // ... (existing code)
+
+  // 当 backendUrl 变化时，保存到 localStorage
+  useEffect(() => {
+    localStorage.setItem('rodoku_backend_url', backendUrl)
+  }, [backendUrl])
   const [err, setErr] = useState<string>('')
   const [lastUpdatedMs, setLastUpdatedMs] = useState<number>(0)
   const [expandedTechId, setExpandedTechId] = useState<string | null>(null)
@@ -709,7 +747,14 @@ export function VizPage() {
               </button>
             </div>
             <div className="muted" style={{ marginBottom: 8 }}>
-              {lastUpdatedMs ? `最近更新时间：${new Date(lastUpdatedMs).toLocaleString()}` : '最近更新时间：无（等待拉取/恢复缓存）'}
+              {lastUpdatedMs ? (
+                <span style={{ color: Date.now() - lastUpdatedMs > 60000 ? '#b42318' : undefined }}>
+                  {Date.now() - lastUpdatedMs > 60000 ? '⚠️ 数据陈旧 (未连接) — ' : ''}
+                  最近更新：{new Date(lastUpdatedMs).toLocaleString()}
+                </span>
+              ) : (
+                '最近更新时间：无（等待拉取/恢复缓存）'
+              )}
             </div>
             <textarea
               className="monoText"
@@ -726,18 +771,60 @@ export function VizPage() {
         {/* 图表区：占满整屏宽度，用网格自动多列 */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(340px, 1fr))', gap: 10 }}>
           <RadarChart title="策略/权重参数多维图" params={metrics?.params} />
-          <LineChart title="Solve Rate" xs={metrics?.steps ?? []} ys={metrics?.solve_rate ?? []} />
-          <LineChart title="Avg Steps" xs={metrics?.steps ?? []} ys={metrics?.avg_steps ?? []} />
-          <LineChart title="技巧库命中（累计）" xs={metrics?.step_axis ?? []} ys={metrics?.techlib_hits ?? []} />
-          <LineChart title="结构步贡献 - rank（累计）" xs={metrics?.step_axis ?? []} ys={metrics?.rank_steps ?? []} />
-          <LineChart title="结构步贡献 - ur（累计）" xs={metrics?.step_axis ?? []} ys={metrics?.ur_steps ?? []} />
-          <LineChart title="结构步贡献 - basic（累计）" xs={metrics?.step_axis ?? []} ys={metrics?.basic_steps ?? []} />
-          <LineChart title="累计删数（来自 solve_job）" xs={metrics?.step_axis ?? []} ys={metrics?.deletions ?? []} />
-          <LineChart title="cand_drop（累计）" xs={metrics?.replay_axis ?? []} ys={metrics?.cand_drop_cum ?? []} />
-          <LineChart title="cand_drop（均值）" xs={metrics?.replay_axis ?? []} ys={metrics?.cand_drop_avg ?? []} />
-          <LineChart title="forced_chain（累计）" xs={metrics?.replay_axis ?? []} ys={metrics?.forced_chain_cum ?? []} />
-          <LineChart title="forced_chain（均值）" xs={metrics?.replay_axis ?? []} ys={metrics?.forced_chain_avg ?? []} />
-          <LineChart title="Train Loss（PyTorch）" xs={(metrics?.train_hist ?? []).map((x) => x.step)} ys={(metrics?.train_hist ?? []).map((x) => x.loss)} />
+          <LineChart
+            title="Solve Rate"
+            xs={metrics?.steps ?? []}
+            ys={metrics?.solve_rate ?? []}
+            description="近 3000 次求解的成功率走势（1.0 = 100%）。"
+          />
+          <LineChart
+            title="Avg Steps"
+            xs={metrics?.steps ?? []}
+            ys={metrics?.avg_steps ?? []}
+            description="成功求解的平均逻辑步数（越低越好，或代表题目变简单）。"
+          />
+          <LineChart
+            title="技巧库命中（累计）"
+            xs={metrics?.step_axis ?? []}
+            ys={metrics?.techlib_hits ?? []}
+            description="累计使用了多少次已归档的技巧结构。"
+          />
+          <LineChart
+            title="结构步贡献 - rank（累计）"
+            xs={metrics?.step_axis ?? []}
+            ys={metrics?.rank_steps ?? []}
+            description="Rank (Truth/Link) 秩逻辑步的累计贡献次数。"
+          />
+          <LineChart
+            title="结构步贡献 - ur（累计）"
+            xs={metrics?.step_axis ?? []}
+            ys={metrics?.ur_steps ?? []}
+            description="UR 唯一性致命结构（或陷阱规避）的累计贡献次数。"
+          />
+          <LineChart
+            title="结构步贡献 - basic（累计）"
+            xs={metrics?.step_axis ?? []}
+            ys={metrics?.basic_steps ?? []}
+            description="基础逻辑步（唯余/摒除等）的累计贡献次数。"
+          />
+          <LineChart
+            title="累计删数（来自 solve_job）"
+            xs={metrics?.step_axis ?? []}
+            ys={metrics?.deletions ?? []}
+            description="所有任务累计删除的候选数总量。"
+          />
+          <LineChart
+            title="cand_drop（累计）"
+            xs={metrics?.replay_axis ?? []}
+            ys={metrics?.cand_drop_cum ?? []}
+            description="Replay 训练数据中的候选数消除总量。"
+          />
+          <LineChart
+            title="Train Loss（PyTorch）"
+            xs={(metrics?.train_hist ?? []).map((x) => x.step)}
+            ys={(metrics?.train_hist ?? []).map((x) => x.loss)}
+            description="策略网络与价值网络的混合损失（越低越好）。反映 AI 预测动作和局面的准确度。"
+          />
         </div>
 
         <div className="panel rankPane" style={{ marginTop: 10 }}>

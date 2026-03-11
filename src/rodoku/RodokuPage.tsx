@@ -38,6 +38,148 @@ export function RodokuPage() {
   const fileRef = useRef<HTMLInputElement | null>(null)
   const expandedStepsRef = useRef<HTMLDivElement | null>(null)
 
+  const [autoSolveEnabled, setAutoSolveEnabled] = useState<boolean>(false)
+
+  // 专门用于 AutoSolve 的轮询器
+  useEffect(() => {
+     if (!autoSolveEnabled) return
+     let cancelled = false
+     let currentJobId: string | null = null
+     
+     const loop = async () => {
+         while (!cancelled) {
+             try {
+                 const base = backendUrl.replace(/\/$/, '')
+                 // 1. 获取当前自动任务 ID
+                 const st = await fetch(`${base}/auto_solve/status`).then(r => r.json())
+                 const jid = st.last_job_id
+                 
+                 if (jid && jid !== currentJobId) {
+                     // 发现新任务：添加到列表并开始跟踪
+                     currentJobId = jid
+                     // 占位 snapshot：81个0 | 162个0
+                     const placeholderSnap = `${"0".repeat(81)}|${"00".repeat(81)}`
+                     const newRun: RodokuRun = {
+                         id: `auto-${jid}`,
+                         jobId: jid,
+                         puzzle: "0".repeat(81), // 占位 puzzle，长度 81 防止解析失败
+                         startedAtMs: Date.now(),
+                         status: 'running',
+                         steps: [],
+                         snapshots: [placeholderSnap]
+                     }
+                     setRuns(prev => [newRun, ...prev]) // 新的在最前
+                     if (followTrainingRef.current) {
+                         setSelectedRunId(`auto-${jid}`)
+                         setExpandedRunId(`auto-${jid}`)
+                     }
+                     
+                     // 启动对该任务的轮询（直到结束）
+                     // 注意：这里我们不用 startSolveJob 里的那个线性逻辑，而是就地轮询
+                     const ac = new AbortController()
+                     while (!cancelled && currentJobId === jid) {
+                         try {
+                             const data = await pollSolveJob(jid, ac.signal)
+                             // 更新 run 数据
+                             setRuns(prev => {
+                                 const idx = prev.findIndex(r => r.jobId === jid)
+                                 if (idx < 0) return prev
+                                 const old = prev[idx]
+                                 // 构建 steps ... (复用之前的逻辑有点罗嗦，这里简化处理)
+                                 // 为简化代码，我们直接把 data.steps 转换一下
+                                 const newSteps = (data.steps||[]).map((s:any, i:number) => ({
+                                     stepIndex: i,
+                                     atMs: Date.now(),
+                                     action: { type: s.action_type, idx: s.affected?.[0]?.[0]??0, d: s.affected?.[0]?.[1]??0 },
+                                     rationale: s.rationale,
+                                     meta: s.meta,
+                                     affected: (s.affected||[]).map((pair:any) => ({idx: pair[0], d: pair[1]}))
+                                 }))
+                                 
+                                 return [
+                                     ...prev.slice(0, idx),
+                                     {
+                                         ...old,
+                                         // 只有当 puzzle 仍是占位符且 snapshot 有效时才尝试恢复
+                                         puzzle: (old.puzzle === "0".repeat(81) || old.puzzle === "Loading...") && data.snapshots?.[0] 
+                                            ? data.snapshots[0].split('|')[0] 
+                                            : old.puzzle,
+                                         status: data.status as any,
+                                         steps: newSteps,
+                                         // 确保 snapshots 至少有一个（占位），防止渲染崩溃
+                                         snapshots: (data.snapshots && data.snapshots.length > 0) 
+                                            ? data.snapshots 
+                                            : (old.snapshots.length > 0 ? old.snapshots : [`${"0".repeat(81)}|${"00".repeat(81)}`]),
+                                         error: data.error
+                                     },
+                                     ...prev.slice(idx+1)
+                                 ]
+                             })
+                             
+                             if (followTrainingRef.current && selectedRunId === `auto-${jid}`) {
+                                 setPlayStep((data.snapshots?.length || 1) - 1)
+                             }
+
+                             if (data.status === 'solved' || data.status === 'error' || data.status === 'stopped') {
+                                 break // 本题结束，跳出内层循环，等待外层获取下一个 jid
+                             }
+                         } catch(e) {
+                             console.warn("Poll error", e)
+                             break
+                         }
+                         await new Promise(r => setTimeout(r, 500))
+                     }
+                 }
+             } catch(e) {
+                 console.error(e)
+             }
+             await new Promise(r => setTimeout(r, 2000))
+         }
+     }
+     loop()
+     return () => { cancelled = true }
+  }, [autoSolveEnabled, backendUrl])
+
+  async function toggleAutoSolve() {
+      const base = backendUrl.replace(/\/$/, '')
+      const next = !autoSolveEnabled
+      setAutoSolveEnabled(next)
+      
+      // 同步配置到后端
+      try {
+        await fetch(`${base}/auto_solve/config`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                enabled: next,
+                params: {
+                    puzzle: "placeholder", // 后端会自动忽略或覆盖
+                    min_t: genMinT,
+                    max_t: genMaxT,
+                    max_r: genMaxR,
+                    max_structures_per_step: 200,
+                    enable_ur1: enableUr1,
+                    use_policy: usePolicy
+                }
+            })
+        })
+      } catch(e) {
+          alert("无法连接后端: " + e)
+          setAutoSolveEnabled(!next) // revert
+      }
+  }
+
+  async function skipAutoSolve() {
+      const base = backendUrl.replace(/\/$/, '')
+      try {
+          await fetch(`${base}/auto_solve/skip`, {
+              method: 'POST'
+          })
+      } catch(e) {
+          console.error("Skip failed", e)
+      }
+  }
+
   const selectedRun = useMemo(() => runs.find((r) => r.id === selectedRunId) ?? null, [runs, selectedRunId])
 
   useEffect(() => {
@@ -72,6 +214,8 @@ export function RodokuPage() {
     if (selectedRun) {
       const idx = Math.max(0, Math.min(playStep, selectedRun.snapshots.length - 1))
       const key = selectedRun.snapshots[idx]
+      // 保护：防止 snapshot 为空或 undefined 导致 boardFromStateKey 崩溃
+      if (!key) return fillAllCandidates(createEmptyBoard())
       const b = boardFromStateKey(key, selectedRun.puzzle)
       return b ?? fillAllCandidates(createEmptyBoard())
     }
@@ -149,6 +293,8 @@ export function RodokuPage() {
   ): Promise<{
     status: string
     message?: string
+    last_progress_at_ms?: number
+    last_heartbeat_at_ms?: number
     steps: Array<{ action_type: 'eliminate' | 'commit'; rationale: string; affected: Array<[number, number | null]>; meta?: any }>
     snapshots: string[]
     error?: string
@@ -227,6 +373,8 @@ export function RodokuPage() {
             const data = await pollSolveJob(jobId, ac.signal)
             const status = String(data.status)
             const msg = (data as any).message ? String((data as any).message) : ''
+            const lastStepAtMs = typeof (data as any).last_progress_at_ms === 'number' ? Number((data as any).last_progress_at_ms) : undefined
+            const lastHeartbeatAtMs = typeof (data as any).last_heartbeat_at_ms === 'number' ? Number((data as any).last_heartbeat_at_ms) : undefined
             if (msg) setTrainMsg(msg)
             if (status === 'stopped') throw new Error('aborted')
             if (status === 'not_found') {
@@ -303,6 +451,9 @@ export function RodokuPage() {
                 startedAtMs: placeholder.startedAtMs,
                 finishedAtMs: status === 'solved' ? Date.now() : undefined,
                 status: runStatus,
+                message: msg || undefined,
+                lastStepAtMs,
+                lastHeartbeatAtMs,
                 steps: builtSteps,
                 snapshots: snapsArr.length > 0 ? snapsArr : [initialStateKey(puzzle)],
                 error: status === 'error' ? String((data as any).error ?? 'error') : undefined,
@@ -470,7 +621,20 @@ export function RodokuPage() {
               >
                 {followTraining ? '跟随刷题：开' : '跟随刷题：关'}
               </button>
-              {!isTraining ? (
+              <button
+                type="button"
+                className={`smallBtn ${autoSolveEnabled ? 'danger' : ''}`}
+                onClick={toggleAutoSolve}
+                title="无尽模式：自动生成/选择题目并持续求解"
+              >
+                {autoSolveEnabled ? '停止无尽模式' : '开启无尽模式'}
+              </button>
+              {autoSolveEnabled ? (
+                  <button type="button" className="smallBtn" onClick={skipAutoSolve} title="跳过当前题目，直接开始下一题">
+                      跳过本题
+                  </button>
+              ) : null}
+              {!isTraining && !autoSolveEnabled ? (
                 <button type="button" className="smallBtn" onClick={startTraining} disabled={puzzles.length === 0}>
                   开始刷题
                 </button>
@@ -596,9 +760,20 @@ export function RodokuPage() {
                           <div className="muted" style={{ marginTop: 4 }}>
                             {r.error
                               ? '（失败：详见红色错误信息）'
-                              : r.steps.length > 0
-                                ? r.steps[r.steps.length - 1].rationale
-                                : '（暂无步骤）'}
+                              : (
+                                  <>
+                                    {r.steps.length > 0 ? (
+                                        <div style={{overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', maxWidth: 380}}>
+                                            Last: {r.steps[r.steps.length - 1].rationale}
+                                        </div>
+                                    ) : null}
+                                    {r.status === 'running' && r.message ? (
+                                        <div style={{color: '#0969da', marginTop: 2, fontSize: '0.9em'}}>
+                                            Thinking: {r.message}
+                                        </div>
+                                    ) : (r.steps.length === 0 ? '（暂无步骤）' : null)}
+                                  </>
+                              )}
                           </div>
                         </div>
 

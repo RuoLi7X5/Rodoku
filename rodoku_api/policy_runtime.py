@@ -77,7 +77,15 @@ def score_actions(state_key: str, actions: List[Tuple[str, int, int]]) -> List[f
     x = torch.from_numpy(np.expand_dims(x_np, axis=0)).to(_DEVICE)
     mask = torch.from_numpy(mask_np).to(_DEVICE)
     with torch.no_grad():
-        logits, _v = _MODEL(x)
+        # Updated for GNN model (4 outputs)
+        out4 = _MODEL(x)
+        if len(out4) == 4:
+            logits, _v, _ur, _rank = out4
+        elif len(out4) == 3:
+            logits, _v, _ur = out4
+        else:
+            logits, _v = out4
+            
         logits = logits.squeeze(0)  # (A,)
         # 用 mask 抑制非法动作
         logits = logits + (mask - 1.0) * 1e9
@@ -109,9 +117,47 @@ def evaluate_state(state_key: str) -> Optional[float]:
     x_np, _mask_np = state_key_to_tensors(state_key)
     x = torch.from_numpy(np.expand_dims(x_np, axis=0)).to(_DEVICE)
     with torch.no_grad():
-        _logits, v = _MODEL(x)
+        out4 = _MODEL(x)
+        if len(out4) == 4:
+            _logits, v, _ur, _rank = out4
+        elif len(out4) == 3:
+            _logits, v, _ur = out4
+        else:
+            _logits, v = out4
+            
         try:
             return float(v.squeeze(0).detach().cpu().item())
+        except Exception:
+            return None
+
+
+def evaluate_ur(state_key: str) -> Optional[float]:
+    """
+    返回 UR Sensor 的唯一性/安全性评分（0.0=危险/多解, 1.0=安全/唯一）。
+    """
+    try:
+        import numpy as np  # type: ignore
+        import torch  # type: ignore
+        from .nn_state import state_key_to_tensors  # type: ignore
+    except Exception:
+        return None
+
+    if not ensure_loaded():
+        return None
+    assert _MODEL is not None and _DEVICE is not None
+    x_np, _mask_np = state_key_to_tensors(state_key)
+    x = torch.from_numpy(np.expand_dims(x_np, axis=0)).to(_DEVICE)
+    with torch.no_grad():
+        out4 = _MODEL(x)
+        if len(out4) != 4:
+            if len(out4) == 3:
+                _logits, _v, ur = out4
+                return float(ur.squeeze(0).detach().cpu().item())
+            return None # Old model doesn't support UR
+            
+        _logits, _v, ur, _rank = out4
+        try:
+            return float(ur.squeeze(0).detach().cpu().item())
         except Exception:
             return None
 
